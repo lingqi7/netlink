@@ -148,6 +148,134 @@ func (h *Handle) ConntrackUpdate(table ConntrackTableType, family InetFamily, fl
 	return err
 }
 
+// ---------------------------------------------------------------------------------start------------------------------------
+// MarkSelector 表示基于 mark/mask 的过滤条件
+type MarkSelector struct {
+	Mark uint32
+	Mask uint32
+}
+
+// ConntrackTableListByMark 按指定 mark/mask 采集 conntrack 数据（内核级过滤）
+func ConntrackTableListByMark(table ConntrackTableType, family InetFamily, mark uint32, mask uint32) ([]*ConntrackFlow, error) {
+	return pkgHandle.ConntrackTableListByMark(table, family, mark, mask)
+}
+
+func (h *Handle) ConntrackTableListByMark(table ConntrackTableType, family InetFamily, mark uint32, mask uint32) ([]*ConntrackFlow, error) {
+	// 调用内核级过滤函数
+	res, executeErr := h.dumpConntrackTableWithMark(table, family, mark, mask)
+	if executeErr != nil && !errors.Is(executeErr, ErrDumpInterrupted) {
+		return nil, executeErr
+	}
+
+	// 反序列化所有从内核获取的 flows (这些已经是过滤后的)
+	var result []*ConntrackFlow
+	for _, dataRaw := range res {
+		result = append(result, parseRawData(dataRaw))
+	}
+
+	// 返回结果和可能的 ErrDumpInterrupted
+	return result, executeErr
+}
+
+// ConntrackTableListByMarks 按多个 mark（OR 关系）采集 conntrack 数据
+// 注意：内核 Netlink 接口通常只支持单一过滤条件。此函数通过多次查询并合并结果来模拟 OR 逻辑。
+func ConntrackTableListByMarks(table ConntrackTableType, family InetFamily, marks []MarkSelector) ([]*ConntrackFlow, error) {
+	return pkgHandle.ConntrackTableListByMarks(table, family, marks)
+}
+
+func (h *Handle) ConntrackTableListByMarks(table ConntrackTableType, family InetFamily, marks []MarkSelector) ([]*ConntrackFlow, error) {
+	if len(marks) == 0 {
+		return nil, fmt.Errorf("marks must not be empty")
+	}
+
+	// 使用 map 去重，key 为 flow 的唯一标识符
+	seenFlows := make(map[string]*ConntrackFlow)
+	var finalErr error
+
+	for _, m := range marks {
+		// 为每个 MarkSelector 调用一次内核级过滤
+		res, err := h.dumpConntrackTableWithMark(table, family, m.Mark, m.Mask)
+		if err != nil {
+			if !errors.Is(err, ErrDumpInterrupted) {
+				// 如果是严重错误，返回
+				return nil, err
+			}
+			// 如果是 ErrDumpInterrupted，记录下来，但继续处理其他 mark
+			finalErr = errors.Join(finalErr, err)
+		}
+
+		// 解析并去重
+		for _, dataRaw := range res {
+			flow := parseRawData(dataRaw)
+			key := flowKey(flow) // 使用 flowKey 函数生成唯一标识
+			if _, exists := seenFlows[key]; !exists {
+				seenFlows[key] = flow
+			}
+		}
+	}
+
+	// 将 map 中的值转换为 slice
+	result := make([]*ConntrackFlow, 0, len(seenFlows))
+	for _, flow := range seenFlows {
+		result = append(result, flow)
+	}
+
+	return result, finalErr
+}
+
+// 核心修复：正确的内核级过滤实现
+// 此函数通过在 Netlink 请求中添加 CTA_FILTER 属性容器来实现内核级过滤。
+func (h *Handle) dumpConntrackTableWithMark(table ConntrackTableType, family InetFamily, mark uint32, mask uint32) ([][]byte, error) {
+	// 1. 创建一个标准的 Conntrack Get Dump 请求
+	req := h.newConntrackRequest(table, family, nl.IPCTNL_MSG_CT_GET, unix.NLM_F_DUMP)
+
+	// 2. 创建 CTA_FILTER 属性容器
+	filterAttr := nl.NewRtAttr(25, nil) // CTA_FILTER = 25
+
+	// 3. 在 CTA_FILTER 容器内创建一个嵌套的 CTA_MARK 属性
+	markFilterAttr := nl.NewRtAttr(unix.NLA_F_NESTED|nl.CTA_MARK, nil)
+	markData := nl.BEUint32Attr(mark)
+	markAttr := nl.NewRtAttr(nl.CTA_MARK, markData)
+	markFilterAttr.AddChild(markAttr)
+
+	// 4. 将嵌套的 CTA_MARK 属性添加到 CTA_FILTER 容器中
+	filterAttr.AddChild(markFilterAttr)
+
+	// 5. 如果 mask 不是默认全匹配 (0xFFFFFFFF 或 0)，则添加 CTA_MARK_MASK 属性
+	if mask != 0 && mask != 0xFFFFFFFF {
+		maskFilterAttr := nl.NewRtAttr(unix.NLA_F_NESTED|nl.CTA_MARK_MASK, nil)
+		maskData := nl.BEUint32Attr(mask)
+		maskAttr := nl.NewRtAttr(nl.CTA_MARK_MASK, maskData)
+		maskFilterAttr.AddChild(maskAttr)
+		filterAttr.AddChild(maskFilterAttr)
+	}
+
+	// 6. 将 CTA_FILTER 属性容器添加到请求中
+	req.AddData(filterAttr)
+
+	// 7. 执行请求并返回结果
+	return req.Execute(unix.NETLINK_NETFILTER, 0)
+}
+
+// 生成用于去重的 key
+func flowKey(f *ConntrackFlow) string {
+	// 生成一个能唯一标识一个 ConntrackFlow 的字符串
+	// 包含关键五元组信息和 zone, mark 以区分不同流
+	// 注意：如果存在 NAT 或者流状态变化，相同连接的 key 可能不同
+	return fmt.Sprintf("%d|%s:%d->%s:%d|%s:%d->%s:%d|%d|%d",
+		f.FamilyType,
+		f.Forward.SrcIP.String(), f.Forward.SrcPort,
+		f.Forward.DstIP.String(), f.Forward.DstPort,
+		f.Reverse.SrcIP.String(), f.Reverse.SrcPort,
+		f.Reverse.DstIP.String(), f.Reverse.DstPort,
+		f.Zone,
+		f.Mark,
+		// f.TimeStart, // 通常不需要，且可能影响去重逻辑
+	)
+}
+
+// --------------------------------------------end-------------------------------------------------------------------------
+
 // ConntrackDeleteFilter deletes entries on the specified table on the base of the filter using the netlink handle passed
 // conntrack -D [table] parameters         Delete conntrack or expectation
 //
